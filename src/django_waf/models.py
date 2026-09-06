@@ -307,6 +307,27 @@ class BlockRule(BaseModel):
             ),
             models.Index(fields=["source", "review_status"], name="django_waf_br_review_idx"),
         ]
+        constraints = [
+            # The anomaly detector identifies an auto-generated rule by
+            # (rule_type, pattern, source=AUTO, action): that tuple is the
+            # update_or_create lookup in services/anomaly_detector.py, and
+            # match_type is a default it writes, not part of the key. Two
+            # concurrent detector runs could each miss the other's row and
+            # both insert, leaving duplicates that _deduplicate_block_rules
+            # had to clean up after the fact. This closes that race in the
+            # database instead (#153).
+            #
+            # Scoped to source=AUTO because only auto rules have a machine
+            # key: admin and feed rules are curated by hand and may
+            # legitimately repeat a (rule_type, pattern, action) shape with
+            # different names, expiries or notes. source is not in the field
+            # list because the condition already restricts the rows to it.
+            models.UniqueConstraint(
+                fields=["rule_type", "pattern", "action"],
+                condition=Q(source=RuleSource.AUTO),
+                name="django_waf_br_auto_key_uniq",
+            ),
+        ]
 
     def __str__(self) -> str:
         return f"[{self.action}] {self.name}"

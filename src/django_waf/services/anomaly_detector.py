@@ -12,7 +12,7 @@ import logging
 from datetime import timedelta
 from decimal import ROUND_HALF_UP, Decimal
 
-from django.db import transaction
+from django.db import IntegrityError, transaction
 from django.utils import timezone
 
 logger = logging.getLogger("django_waf.anomaly_detector")
@@ -1670,7 +1670,19 @@ def _get_or_create_auto_rule(
 
     If duplicate rows already exist (created before this function existed, or
     via a race condition), catches MultipleObjectsReturned, deduplicates by
-    keeping the newest row and deleting the rest, then retries.
+    keeping the newest row and deleting the rest, then retries. That branch is
+    still load-bearing after #153: it covers a consumer whose migration 0008
+    has not run yet, and duplicate rows the partial constraint does not cover
+    (it is scoped to source=AUTO, so hand-curated admin and feed duplicates
+    reach here unconstrained).
+
+    Losing an insert race (#153) no longer produces a duplicate row and no
+    longer escapes as an exception: the partial UniqueConstraint added in
+    migration 0008 rejects the losing INSERT, and
+    ``_update_or_create_auto_rule`` catches the IntegrityError inside a
+    savepoint and merges into the row that won instead. The losing run
+    therefore returns ``created=False``, because it refreshed an existing row
+    rather than inserting one.
 
     When ``dry_run`` is True (#38), performs a read-only existence check
     instead of update_or_create: no BlockRule is written, activated, or
@@ -1768,6 +1780,13 @@ def _get_or_create_auto_rule(
         Its ``pk`` is not unset: ``BlockRule.id`` is a UUIDField with
         ``default=uuid.uuid4``, so Django generates the UUID at
         instantiation regardless of whether the instance is ever saved.
+
+    Raises:
+        BlockRule.DoesNotExist: when this run lost the insert race and the
+            winning row was then deleted before it could be merged into, so
+            there is no rule to return. Rare and genuinely concurrent;
+            surfaced rather than swallowed because every caller dereferences
+            the returned rule.
     """
     from django_waf import conf
     from django_waf.enums import ReviewStatus, RuleSource
@@ -1862,8 +1881,83 @@ def _update_or_create_auto_rule(lookup: dict, defaults: dict, detector_name: str
     CONFIRMED/REJECTED rule's detector set still accumulates on
     re-detection exactly as an unreviewed rule's does.
 
+    Lost-race recovery (#153): since migration 0008 the auto key is backed by
+    a partial UniqueConstraint (source=AUTO), so when a concurrent run inserts
+    the same key between the read above and this write, the losing side now
+    gets an IntegrityError from the database rather than silently inserting a
+    second row. Handling it means catching that error and re-running the read,
+    guard and merge against the row that won. The retry MUST be wrapped in its
+    own savepoint: an IntegrityError inside the caller's transaction.atomic()
+    poisons the whole block, and every later query in it (including the
+    re-read) would raise TransactionManagementError instead of executing. The
+    nested atomic() opens a savepoint that rolls back just the failed INSERT,
+    leaving the outer transaction usable.
+
     Must run inside the same transaction.atomic() block as its caller so the
     read and the write are consistent.
+    """
+    from django_waf.models import BlockRule
+
+    _existing, write_defaults = _auto_rule_write_defaults(lookup, defaults, detector_name)
+
+    try:
+        with transaction.atomic():
+            return BlockRule.objects.update_or_create(**lookup, defaults=write_defaults)
+    except IntegrityError:
+        logger.warning(
+            "django-waf: concurrent insert won the auto-rule race for %s/%s, merging into the existing row",
+            lookup.get("rule_type"),
+            lookup.get("pattern"),
+        )
+
+    # The savepoint above rolled back, so the outer transaction is usable and
+    # the winning row is now visible. Re-derive the write defaults from it, so
+    # the losing run applies the SAME BR-ANOM-007 review-status guard and the
+    # SAME additive detectors merge it would have applied had it read the row
+    # first: an operator's CONFIRMED/REJECTED decision survives, and this
+    # run's detector name still joins the merged set.
+    winner, retry_defaults = _auto_rule_write_defaults(lookup, defaults, detector_name)
+    if winner is None:
+        # The winner was deleted between the IntegrityError and this re-read
+        # (an expiry sweep, an operator delete, a concurrent dedupe). Falling
+        # through to update_or_create here would silently re-insert and report
+        # created=True, contradicting the IntegrityError that just proved the
+        # key was taken, and a bare return would hand None to callers that
+        # dereference the rule. Raise instead: the caller's contract is a real
+        # BlockRule, and this state is a genuine race worth surfacing.
+        raise BlockRule.DoesNotExist(f"django-waf: auto BlockRule for {lookup} vanished after a lost insert race")
+    # The row exists, so update_or_create takes its UPDATE branch: it applies
+    # the same auto_now/save() path as the ordinary write (a queryset .update()
+    # would skip updated_at) and returns created=False, which is exactly the
+    # docstring's contract for a row that already existed and was refreshed.
+    return BlockRule.objects.update_or_create(**lookup, defaults=retry_defaults)
+
+
+def _auto_rule_write_defaults(lookup: dict, defaults: dict, detector_name: str) -> tuple:
+    """Read the stored auto rule and build the write defaults derived from it.
+
+    Returns ``(existing, write_defaults)``. ``existing`` is the stored row or
+    None; it is returned rather than discarded because the lost-race path
+    needs to know whether the winning row is still there, and re-querying for
+    that would be a second read that can disagree with this locked one.
+
+    Reads the existing (rule_type, pattern, source=AUTO, action) row under
+    ``select_for_update()`` and derives the values to write from it:
+
+    - BR-ANOM-007: when the stored row is CONFIRMED or REJECTED, ``is_active``
+      and ``review_status`` are dropped entirely, so a re-detection refreshes
+      only expires_at and the evidence fields and can never undo an operator's
+      decision.
+    - #97: ``detectors`` is merged additively against the stored value, so this
+      run contributes its name without removing any prior detector's.
+
+    Factored out because ``_update_or_create_auto_rule`` needs exactly this
+    derivation twice, once before the write and once again after losing an
+    insert race, against a row it could not see the first time. Copying the
+    two guards would let the race path drift from the ordinary path, which is
+    precisely the divergence BR-ANOM-007 forbids.
+
+    Must run inside the caller's transaction.atomic() block.
     """
     from django_waf.enums import ReviewStatus
     from django_waf.models import BlockRule
@@ -1878,8 +1972,7 @@ def _update_or_create_auto_rule(lookup: dict, defaults: dict, detector_name: str
         existing.detectors if existing is not None else "",
         detector_name,
     )
-
-    return BlockRule.objects.update_or_create(**lookup, defaults=write_defaults)
+    return existing, write_defaults
 
 
 def _deduplicate_block_rules(**lookup) -> int:
