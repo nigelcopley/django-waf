@@ -5,6 +5,53 @@ All notable changes to django-waf will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.10.0] - 2026-09-06
+### Fixed
+
+- Duplicate auto-generated `BlockRule` rows no longer render duplicate
+  entries in the generated nginx blocklist. `_render_ip_geo` and
+  `_render_ua_map` now deduplicate on the rendered key, so a `geo` or
+  `map` block carries each address or user-agent at most once per output
+  variable whatever the rule table holds. A consumer whose `nginx -t`
+  printed `[warn] duplicate network "..."` on every config test stops
+  seeing it. The block and throttle variables are unaffected: the same IP
+  under both a block and a throttle rule still appears in each, since the
+  renderers are called once per variable with disjoint rule lists (#153).
+- The anomaly detector can no longer persist two `source=auto` rules for
+  one key. Two concurrent first-time detections of the same key could each
+  miss the other's row and both insert, because `select_for_update()` on an
+  empty result set locks nothing. A partial `UniqueConstraint` on
+  `(rule_type, pattern, action)` scoped to `source=auto` now rejects the
+  losing insert, and `_update_or_create_auto_rule` catches the
+  `IntegrityError` inside a savepoint and merges into the row that won,
+  returning `created=False`. An operator's `confirmed` or `rejected` review
+  decision survives that merge unchanged (BR-ANOM-007), and the losing
+  run's detector name still joins the merged `detectors` set (#153).
+
+### Changed
+
+- **Upgrading deletes duplicate auto-generated rules.** Migration
+  `0008_dedupe_auto_block_rules` keeps the newest row per
+  `(rule_type, pattern, action)` among `source=auto` rows and deletes the
+  rest, before adding the constraint. This is the policy the detector
+  already applied whenever it re-detected a duplicated key
+  (`_deduplicate_block_rules`, keep-newest by `created_at`), so it removes
+  nothing a later detection would not have removed anyway. Rules with
+  `source=admin` or `source=feed` are **not** covered by the constraint and
+  are **not** touched by the migration: hand-curated rules may legitimately
+  repeat a shape with different names, expiries or notes. Reversing the
+  migration drops the constraint but does not restore deleted rows (#153).
+- `_get_or_create_auto_rule` now raises `BlockRule.DoesNotExist` in one new
+  and genuinely concurrent case: this run lost the insert race and the
+  winning row was then deleted before it could be merged into. Previously
+  no constraint existed, so this state was unreachable. It is surfaced
+  rather than swallowed because every caller dereferences the returned rule
+  (#153).
+
+Verified on the backends CI runs: SQLite (the matrix legs) and PostgreSQL
+(the dedicated leg). Partial-constraint enforcement is not exercised on any
+other backend.
+
 ## [2.9.0] - 2026-09-04
 ### Changed
 

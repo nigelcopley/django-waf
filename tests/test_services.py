@@ -2038,9 +2038,16 @@ class TestGetOrCreateAutoRuleDedup:
     deduplicates by keeping the newest row, and retries.
     """
 
-    @pytest.mark.django_db
-    def test_deduplicates_and_retries_on_multiple_objects_returned(self):
-        """Pre-existing duplicates are cleaned up, then the rule is created normally."""
+    def test_deduplicates_and_retries_on_multiple_objects_returned(self, _auto_key_constraint_dropped):
+        """Pre-existing duplicates are cleaned up, then the rule is created normally.
+
+        Since #153 the auto key carries a partial UniqueConstraint, so this
+        scenario can no longer be seeded on a migrated database and the
+        fixture drops the constraint first. The branch under test is still
+        load-bearing rather than dead code: it covers a consumer whose
+        migration 0008 has not run yet, which is exactly the unconstrained
+        state the fixture reproduces.
+        """
         from django_waf.enums import RuleAction, RuleSource, RuleType
         from django_waf.models import BlockRule
         from django_waf.services.anomaly_detector import _get_or_create_auto_rule
@@ -5565,12 +5572,16 @@ class TestRuleEngineHelpers:
             _create_escalation_rule("203.0.113.79")
 
     @pytest.mark.django_db
-    def test_create_escalation_rule_deduplicates_existing_rows(self):
+    def test_create_escalation_rule_deduplicates_existing_rows(self, _auto_key_constraint_dropped):
         """Pre-existing duplicate BlockRule rows are deduplicated, then the rule is created.
 
         Regression: update_or_create raises MultipleObjectsReturned if
         duplicate rows exist for the same (rule_type, pattern, source, action)
         key. The fix catches this, deduplicates, and retries.
+
+        Since #153 the partial UniqueConstraint prevents this state being
+        seeded, so the fixture drops it to reproduce a pre-migration-0008
+        consumer, which is the case the branch still exists to serve.
         """
         from django_waf.enums import RuleAction, RuleSource, RuleType
         from django_waf.models import BlockRule

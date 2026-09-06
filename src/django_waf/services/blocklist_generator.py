@@ -134,23 +134,49 @@ def generate_nginx_blocklist(output_path: str | None = None) -> int:
 
 
 def _render_ua_map(variable: str, rules: list[BlockRule]) -> list[str]:
-    """Render an nginx ``map $http_user_agent`` block for one action's UA rules."""
+    """Render an nginx ``map $http_user_agent`` block for one action's UA rules.
+
+    Deduplicates on the rendered key rather than the rule row (#153): two
+    distinct BlockRule rows whose patterns escape to the same nginx key
+    would otherwise emit a duplicate entry, which nginx accepts but reports
+    as a warning on every ``nginx -t`` (observed on a consumer box as
+    ``nginx: [warn] duplicate network ...``). First occurrence wins, which
+    given the incoming ordering (for_nginx() builds on active(), whose
+    ``.order_by("priority")`` replaces Meta.ordering) is the lowest
+    ``priority`` value, i.e. the most significant rule for the key. Rules
+    tied on priority are in unspecified database order, but they render the
+    same key, so which one wins does not change the output.
+    """
     lines = [f"map $http_user_agent {variable} {{\n", "    default 0;\n"]
+    seen: set[str] = set()
     for rule in rules:
         escaped = _nginx_escape_ua(rule.pattern, rule.match_type)
-        if escaped:
+        if escaped and escaped not in seen:
+            seen.add(escaped)
             lines.append(f"    {escaped} 1;\n")
     lines.append("}\n\n")
     return lines
 
 
 def _render_ip_geo(variable: str, rules: list[BlockRule]) -> list[str]:
-    """Render an nginx ``geo`` block for one action's IP/CIDR rules."""
+    """Render an nginx ``geo`` block for one action's IP/CIDR rules.
+
+    Deduplicates on the rendered address rather than the rule row, for the
+    same reason as _render_ua_map (#153); a repeated address in a ``geo``
+    block is what produced the reported warning. First occurrence wins.
+
+    The ``seen`` set is local to one call, and the caller invokes this once
+    per variable with a disjoint rule list, so the block/throttle split
+    (BR-BL-001) is untouched: the same IP under both a block and a throttle
+    rule still lands in $waf_block_ip and $waf_throttle_ip alike.
+    """
     lines = [f"geo {variable} {{\n", "    default 0;\n"]
+    seen: set[str] = set()
     for rule in rules:
         # For IP rules the pattern is already a valid IP or CIDR
         safe = rule.pattern.strip()
-        if safe:
+        if safe and safe not in seen:
+            seen.add(safe)
             lines.append(f"    {safe} 1;\n")
     lines.append("}\n\n")
     return lines

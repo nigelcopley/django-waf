@@ -125,6 +125,211 @@ class TestBlockThrottleSeparation:
         assert "map $http_user_agent $waf_throttle_ua" in content
 
 
+class TestRenderedEntryDeduplication:
+    """Duplicate BlockRule rows must never render a duplicate nginx entry (#153).
+
+    nginx accepts a repeated key in a ``map`` or ``geo`` block but warns on
+    every ``nginx -t`` (observed on a consumer box as ``nginx: [warn]
+    duplicate network ...``), and the duplicate row pair survives until the
+    key is next re-detected. Dedup is on the RENDERED key, not the rule row,
+    since two distinct rows can escape to the same key.
+    """
+
+    def test_duplicate_ip_pattern_renders_one_geo_entry(self, db, tmp_path, settings):
+        """Two active rules for the same IP render exactly one line in the geo block.
+
+        The rows are left at the factory's default ``source=admin`` rather
+        than ``auto``: the partial UniqueConstraint added in migration 0008
+        covers ``source=auto`` only, so a duplicate auto pair can no longer be
+        inserted at all on a migrated database. Admin duplicates remain
+        legitimate and reachable, and they exercise the renderer identically,
+        because _render_ip_geo dedupes on the rendered address without
+        consulting ``source``.
+        """
+        from django_waf.services.blocklist_generator import generate_nginx_blocklist
+
+        _disable_nginx_validation(settings)
+        BlockRuleFactory(
+            is_active=True,
+            rule_type="ip",
+            match_type="exact",
+            pattern="192.0.2.44",
+            action="block",
+            priority=50,
+        )
+        BlockRuleFactory(
+            is_active=True,
+            rule_type="ip",
+            match_type="exact",
+            pattern="192.0.2.44",
+            action="block",
+            priority=90,
+        )
+        output_file = str(tmp_path / "blocklist.conf")
+
+        generate_nginx_blocklist(output_path=output_file)
+
+        content = Path(output_file).read_text()
+        block_section = content.split("geo $waf_block_ip")[1].split("}")[0]
+
+        assert block_section.count("    192.0.2.44 1;\n") == 1
+        # Positive control: the entry is genuinely present, so the count
+        # above is not vacuously satisfied by an absent pattern.
+        assert "192.0.2.44" in block_section
+
+    def test_duplicate_ua_pattern_renders_one_map_entry(self, db, tmp_path, settings):
+        """Two active rules for the same UA render exactly one line in the map block."""
+        from django_waf.services.blocklist_generator import generate_nginx_blocklist
+
+        _disable_nginx_validation(settings)
+        BlockRuleFactory(
+            is_active=True,
+            rule_type="ua",
+            match_type="exact",
+            pattern="DupeBot/2.0",
+            action="block",
+            priority=50,
+        )
+        BlockRuleFactory(
+            is_active=True,
+            rule_type="ua",
+            match_type="exact",
+            pattern="DupeBot/2.0",
+            action="block",
+            priority=90,
+        )
+        output_file = str(tmp_path / "blocklist.conf")
+
+        generate_nginx_blocklist(output_path=output_file)
+
+        content = Path(output_file).read_text()
+        block_ua_section = content.split("map $http_user_agent $waf_block_ua")[1].split("}")[0]
+
+        assert block_ua_section.count('    "DupeBot/2.0" 1;\n') == 1
+        assert '"DupeBot/2.0"' in block_ua_section
+
+    def test_same_ip_under_block_and_throttle_still_lands_in_both_variables(self, db, tmp_path, settings):
+        """Dedup is per variable: the block/throttle split (BR-BL-001) is unchanged."""
+        from django_waf.services.blocklist_generator import generate_nginx_blocklist
+
+        _disable_nginx_validation(settings)
+        BlockRuleFactory(
+            is_active=True,
+            rule_type="ip",
+            match_type="exact",
+            pattern="192.0.2.77",
+            action="block",
+        )
+        BlockRuleFactory(
+            is_active=True,
+            rule_type="ip",
+            match_type="exact",
+            pattern="192.0.2.77",
+            action="throttle",
+        )
+        output_file = str(tmp_path / "blocklist.conf")
+
+        generate_nginx_blocklist(output_path=output_file)
+
+        content = Path(output_file).read_text()
+        block_section = content.split("geo $waf_block_ip")[1].split("}")[0]
+        throttle_section = content.split("geo $waf_throttle_ip")[1].split("}")[0]
+
+        assert block_section.count("    192.0.2.77 1;\n") == 1
+        assert throttle_section.count("    192.0.2.77 1;\n") == 1
+
+    def test_duplicate_free_rule_set_renders_byte_identical_output(self, db, tmp_path, settings):
+        """With no duplicates, the generated file is byte-for-byte the pre-#153 output.
+
+        The whole file is pinned, header comments, blank-line separators,
+        block order and entry order included, so any change to the rendered
+        bytes for a duplicate-free rule set fails here. This is the
+        additive-change proof: dedup must be a no-op when there is nothing
+        to dedupe.
+        """
+        from django_waf.services.blocklist_generator import generate_nginx_blocklist
+
+        _disable_nginx_validation(settings)
+        # Priorities are distinct and ascending so entry order is fully
+        # determined: for_nginx() builds on active(), whose
+        # .order_by("priority") replaces Meta.ordering, leaving no
+        # secondary key to depend on.
+        BlockRuleFactory(
+            is_active=True,
+            rule_type="ua",
+            match_type="exact",
+            pattern="UniqueBlockBot/1.0",
+            action="block",
+            priority=10,
+        )
+        BlockRuleFactory(
+            is_active=True,
+            rule_type="ua",
+            match_type="exact",
+            pattern="UniqueThrottleBot/1.0",
+            action="throttle",
+            priority=20,
+        )
+        BlockRuleFactory(
+            is_active=True,
+            rule_type="ip",
+            match_type="exact",
+            pattern="192.0.2.10",
+            action="block",
+            priority=30,
+        )
+        BlockRuleFactory(
+            is_active=True,
+            rule_type="cidr",
+            match_type="exact",
+            pattern="198.51.100.0/24",
+            action="block",
+            priority=40,
+        )
+        BlockRuleFactory(
+            is_active=True,
+            rule_type="ip",
+            match_type="exact",
+            pattern="203.0.113.10",
+            action="throttle",
+            priority=50,
+        )
+        output_file = str(tmp_path / "blocklist.conf")
+
+        generate_nginx_blocklist(output_path=output_file)
+
+        expected = (
+            "# Generated by django-waf, do not edit manually\n"
+            "# This file is regenerated every 5 minutes by the generate_blocklist task.\n"
+            "# Declares variables only; see django_waf/conf/nginx/ for the reference\n"
+            "# enforcement snippet (block => 403, throttle => limit_req).\n"
+            "\n"
+            "map $http_user_agent $waf_block_ua {\n"
+            "    default 0;\n"
+            '    "UniqueBlockBot/1.0" 1;\n'
+            "}\n"
+            "\n"
+            "map $http_user_agent $waf_throttle_ua {\n"
+            "    default 0;\n"
+            '    "UniqueThrottleBot/1.0" 1;\n'
+            "}\n"
+            "\n"
+            "geo $waf_block_ip {\n"
+            "    default 0;\n"
+            "    192.0.2.10 1;\n"
+            "    198.51.100.0/24 1;\n"
+            "}\n"
+            "\n"
+            "geo $waf_throttle_ip {\n"
+            "    default 0;\n"
+            "    203.0.113.10 1;\n"
+            "}\n"
+            "\n"
+        )
+
+        assert Path(output_file).read_text() == expected
+
+
 class TestReferenceFilesShipped:
     def test_http_include_reference_file_exists(self):
         from django_waf.services import blocklist_generator
