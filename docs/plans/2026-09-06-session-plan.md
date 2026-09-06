@@ -22,7 +22,7 @@ claim from when it was written.
 | #40 | Umbrella spec drift. Waits on umbrella #621. Nothing to do here. |
 | #37 | `triage:needs-info`. Parked until the reporter answers. |
 | Local repo | `main` only, working tree clean, worktree list is `main` only, `build/` and `dist/` removed. |
-| Stash | `stash@{0}` ("teeth-check: temporarily revert source fix", sha `fa0a60f`) is still present: a repo hook blocks stash dropping from an agent session. Its two settings and their detector uses are on `main` (PR #110), so it holds nothing unmerged. Owner drops it. |
+| Stash | None. The stale `stash@{0}` ("teeth-check: temporarily revert source fix", sha `fa0a60f`) was dropped by the owner on 2026-09-06; its settings and detector uses were already on `main` (PR #110). |
 | Session URLs on `main` | Seven commits carry a `claude.ai/code` link in the body: `69c9986`, `99d1a9b`, `338944e`, `ce7e92e`, `db1e178`, `5c0e29a`, `3f5c49f`. Removing them rewrites tagged, published history. Owner decision; the recommendation is to leave them. |
 
 ### What was proven for #153 on 2.9.0, not assumed
@@ -192,8 +192,6 @@ losing detector run.
 
 ## Owner decisions requested
 
-1. Drop the stale stash `stash@{0}` (a hook blocks it from an agent
-   session). It holds nothing unmerged.
-2. Leave or rewrite the seven session-URL commits on `main`. Rewriting
+1. Leave or rewrite the seven session-URL commits on `main`. Rewriting
    moves `v2.9.0` and every earlier tag on the affected range; the
    recommendation is to leave them.
